@@ -88,6 +88,35 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+static void handle_received_opus(const uint8_t *data, size_t len) {
+    if (len < 4) {
+        ESP_LOGE(TAG, "Received frame too short");
+        return;
+    }
+
+    // Extract frame length from header (first 4 bytes)
+    uint32_t frame_len;
+    memcpy(&frame_len, data, 4);
+    frame_len = ntohl(frame_len);  // Convert from network byte order
+
+    if (frame_len > MAX_FRAME_SIZE) {
+        ESP_LOGE(TAG, "Received frame too large: %" PRIu32, frame_len);
+        return;
+    }
+
+    // Decode Opus data to PCM
+    int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));
+    int frame_size = opus_codec_decode(s_opus_codec, data + 4, frame_len, pcm_data);
+    
+    if (frame_size > 0) {
+        // Play the decoded audio
+        vb6824_audio_write((uint8_t *)pcm_data, frame_size * 2);
+        ESP_LOGD(TAG, "Played frame: %d samples", frame_size);
+    } else {
+        ESP_LOGE(TAG, "Failed to decode Opus data: %d", frame_size);
+    }
+}
+
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
@@ -107,6 +136,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         case WEBSOCKET_EVENT_DATA:
             if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
                 ESP_LOGI(TAG, "Received text: %.*s", data->data_len, (char *)data->data_ptr);
+            } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                handle_received_opus((const uint8_t *)data->data_ptr, data->data_len);
             }
             break;
         default:
@@ -146,7 +177,6 @@ static void send_stop_message(void) {
 void __read_task(void *arg) {
     // Align buffers to 16 bytes for better performance
     uint8_t data[MAX_FRAME_SIZE] __attribute__((aligned(16)));
-    int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));
     
     while (1) {
         if (is_recording) {
@@ -169,14 +199,6 @@ void __read_task(void *arg) {
                     
                     ESP_LOGD(TAG, "Sent frame: %d bytes", len + 4);
                 }
-                
-                // Decode for local playback if needed
-                // int frame_size = opus_codec_decode(s_opus_codec, data, len, pcm_data);
-                // if (frame_size > 0) {
-                //     vb6824_audio_write((uint8_t *)pcm_data, frame_size * 2);
-                // } else {
-                //     ESP_LOGE(TAG, "Failed to decode Opus data: %d", frame_size);
-                // }
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(100)); // Avoid busy waiting
