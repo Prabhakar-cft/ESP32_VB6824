@@ -107,6 +107,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         case WEBSOCKET_EVENT_DATA:
             if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
                 ESP_LOGI(TAG, "Received text: %.*s", data->data_len, (char *)data->data_ptr);
+            } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                // Assume server sends Opus-encoded audio, decode and play
+                if (s_opus_codec) {
+                    int16_t pcm_data[FRAME_SIZE * 2]; // Enough for stereo if needed
+                    int frame_size = opus_codec_decode(s_opus_codec, (const uint8_t *)data->data_ptr, data->data_len, pcm_data);
+                    if (frame_size > 0) {
+                        // Write PCM to VB for playback
+                        vb6824_audio_write((uint8_t *)pcm_data, frame_size * sizeof(int16_t));
+                        ESP_LOGD(TAG, "Played %d samples from server", frame_size);
+                    } else {
+                        ESP_LOGE(TAG, "Failed to decode Opus data from server: %d", frame_size);
+                    }
+                }
             }
             break;
         default:
@@ -185,29 +198,28 @@ void __read_task(void *arg) {
 }
 
 static void button_task(void *arg) {
-    bool last_button_state = false;
-    
+    bool last_button_state = true; // Button not pressed (active low)
+    bool recording_started = false;
     while (1) {
         bool current_button_state = gpio_get_level(BUTTON_GPIO);
-        
-        // Button press detection (active low)
+        // Button pressed (active low)
         if (!current_button_state && last_button_state) {
-            is_recording = !is_recording;
-            
-            if (is_recording) {
-                ESP_LOGI(TAG, "Starting recording session");
+            if (!is_recording) {
+                is_recording = true;
+                ESP_LOGI(TAG, "Button pressed: Starting recording session");
                 send_start_message();
-            } else {
-                ESP_LOGI(TAG, "Stopping recording session");
+            }
+        }
+        // Button released (active high)
+        if (current_button_state && !last_button_state) {
+            if (is_recording) {
+                is_recording = false;
+                ESP_LOGI(TAG, "Button released: Stopping recording session");
                 send_stop_message();
             }
-            
-            // Debounce delay
-            vTaskDelay(pdMS_TO_TICKS(200));
         }
-        
         last_button_state = current_button_state;
-        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to prevent busy waiting
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 

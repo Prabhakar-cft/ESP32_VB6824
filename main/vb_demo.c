@@ -14,19 +14,19 @@
 #include "mbedtls/base64.h"
 
 #define TAG "VB_DEMO"
-#define WS_URI "ws://192.168.1.155:5000/ws/audio"
+#define WS_URI "ws://192.168.1.195:5000/ws/audio"
 #define BUTTON_GPIO GPIO_NUM_3  // Using GPIO3 as button input
 #define VOLUME_UP_GPIO GPIO_NUM_5
 
 // WiFi credentials
-#define WIFI_SSID "Your_SSID"
-#define WIFI_PASS "Your_Password"
+#define WIFI_SSID "craftech360"
+#define WIFI_PASS "cftCFT360"
 
 // Audio configuration (matches Python client)
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
-#define FRAME_DURATION 20  // ms
-#define FRAME_SIZE 320//  // 320 samples for 20ms at 16kHz
+#define FRAME_DURATION 20*3  // ms
+#define FRAME_SIZE 320*3//  // 320 samples for 20ms at 16kHz
 #define MAX_FRAME_SIZE 1275  // Maximum Opus frame size
 #define READ_TASK_STACK_SIZE 8192
 

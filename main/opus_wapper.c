@@ -29,7 +29,7 @@ OpusCodec* opus_codec_init(int enc_fs, int dec_fs, int duration_ms, int channels
 
 
 int opus_codec_decode(OpusCodec* codec, const uint8_t* data, int data_size, int16_t* output) {
-    int frame_size = opus_decode(codec->decoder, data, data_size, output, 320, 0);
+    int frame_size = opus_decode(codec->decoder, data, data_size, output, 320*3, 0);
     if(frame_size < 0) {
         ESP_LOGE(TAG, "Decode failed: %s", opus_strerror(frame_size));
         return -1;
