@@ -8,15 +8,13 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
-#include <arpa/inet.h>  // For htonl, ntohl, ntohs
+#include <arpa/inet.h>  // For htonl
 #include "esp_random.h"  // For UUID generation
 #include <inttypes.h>   // For PRIx32 format specifiers
-#include "mbedtls/base64.h"
 
 #define TAG "VB_DEMO"
 #define WS_URI "ws://192.168.1.195:5000/ws/audio"
 #define BUTTON_GPIO GPIO_NUM_3  // Using GPIO3 as button input
-#define VOLUME_UP_GPIO GPIO_NUM_5
 
 // WiFi credentials
 #define WIFI_SSID "craftech360"
@@ -25,49 +23,37 @@
 // Audio configuration (matches Python client)
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
-#define FRAME_DURATION 20*3  // ms
-#define FRAME_SIZE 320*3//  // 320 samples for 20ms at 16kHz
+#define FRAME_DURATION 60  // ms (60ms per frame)
+#define FRAME_SIZE (SAMPLE_RATE * FRAME_DURATION / 1000)  // 960 samples for 60ms at 16kHz
 #define MAX_FRAME_SIZE 1275  // Maximum Opus frame size
 #define READ_TASK_STACK_SIZE 8192
-
-static uint8_t s_volume = 50; // Start at 50%
 
 // Session control
 static char session_id[37];  // UUID4 string length + null terminator
 OpusCodec *s_opus_codec = NULL;
 esp_websocket_client_handle_t ws_client = NULL;
 TaskHandle_t read_task_handle = NULL;
-static bool ws_connected = false;
-static bool playback_enabled = false;
+bool is_recording = false;
+bool ws_connected = false;
 
-// State management
-typedef enum {
-    STATE_IDLE = 0,
-    STATE_RECORDING,
-    STATE_PLAYBACK,
-    STATE_ERROR
-} app_state_t;
-
-static app_state_t app_state = STATE_IDLE;
-
-// Playback buffer for incoming PCM (only needed if accumulating smaller PCM chunks, not for Opus)
-// static int16_t s_pcm_playback_buffer[FRAME_SIZE]; // FRAME_SIZE is 320 samples
-// static size_t s_pcm_playback_buffer_idx = 0;      // Current index in samples
-
-// Generate a UUID4 string
+// Generate a UUID4 string (RFC 4122 compliant)
 static void generate_uuid4(char *uuid_str) {
-    uint32_t random[4];
-    for (int i = 0; i < 4; i++) {
-        random[i] = esp_random();
+    uint8_t uuid[16];
+    for (int i = 0; i < 16; i++) {
+        uuid[i] = (uint8_t)esp_random();
     }
-    
-    snprintf(uuid_str, 37, "%08" PRIx32 "-%04" PRIx32 "-%04" PRIx32 "-%04" PRIx32 "-%08" PRIx32 "%04" PRIx32,
-             random[0],
-             (random[1] >> 16) & 0xFFFF,
-             random[1] & 0xFFFF,
-             (random[2] >> 16) & 0xFFFF,
-             random[2] & 0xFFFFFFFF,
-             random[3] & 0xFFFF);
+    // Set version (4) and variant (10)
+    uuid[6] = (uuid[6] & 0x0F) | 0x40; // Version 4
+    uuid[8] = (uuid[8] & 0x3F) | 0x80; // Variant 10
+
+    snprintf(uuid_str, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        uuid[0], uuid[1], uuid[2], uuid[3],
+        uuid[4], uuid[5],
+        uuid[6], uuid[7],
+        uuid[8], uuid[9],
+        uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+    );
 }
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -106,24 +92,6 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void volume_up_task(void *arg) {
-    bool last_button_state = false;
-    while (1) {
-        bool current_button_state = gpio_get_level(VOLUME_UP_GPIO);
-        if (!current_button_state && last_button_state) {
-            if (s_volume < 100) {
-                s_volume += 10;
-                if (s_volume > 100) s_volume = 100;
-                vb6824_audio_set_output_volume(s_volume);
-                ESP_LOGI(TAG, "Volume increased to %d%%", s_volume);
-            }
-            vTaskDelay(pdMS_TO_TICKS(200)); // Debounce
-        }
-        last_button_state = current_button_state;
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
 // Reverted and modified function to handle Opus from server
 static void handle_received_opus_from_server(const uint8_t *data, size_t len) {
     if (len < 4) {
@@ -159,45 +127,27 @@ static void handle_received_opus_from_server(const uint8_t *data, size_t len) {
     }
 }
 
-static void handle_received_base64_opus(const char *base64_str, size_t base64_len) {
-    uint8_t opus_data[MAX_FRAME_SIZE];
-    size_t opus_len = 0;
-    int ret = mbedtls_base64_decode(opus_data, sizeof(opus_data), &opus_len, (const unsigned char *)base64_str, base64_len);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Base64 decode failed: %d", ret);
-        return;
-    }
-    int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));
-    int frame_size = opus_codec_decode(s_opus_codec, opus_data, opus_len, pcm_data);
-    if (frame_size > 0) {
-        vb6824_audio_write((uint8_t *)pcm_data, frame_size * 2);
-        ESP_LOGD(TAG, "Played decoded base64 Opus frame: %d samples", frame_size);
-    } else {
-        ESP_LOGE(TAG, "Failed to decode base64 Opus data: %d", frame_size);
-    }
-}
-
-static void websocket_event_handler(void *handler_args, esp_event_base_t event_base, int32_t event_id, void *event_data)
+static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
             ws_connected = true;
-            ESP_LOGI(TAG, "WebSocket connected");
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
             ws_connected = false;
-            ESP_LOGI(TAG, "WebSocket disconnected");
+            break;
+        case WEBSOCKET_EVENT_ERROR:
+            ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
+            ws_connected = false;
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (playback_enabled && data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
-                // int16_t pcm_data[320];
-                // int frame_size = opus_codec_decode(s_opus_codec, (uint8_t *)data->data_ptr, data->data_len, pcm_data);
-                // if (frame_size > 0) {
-                //     vb6824_audio_write((uint8_t *)pcm_data, frame_size * 2);
-                // } else {
-                //     ESP_LOGE(TAG, "Failed to decode Opus data from server");
-                // }
+            if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
+                ESP_LOGI(TAG, "Received server JSON: %.*s", data->data_len, (char *)data->data_ptr);
+            } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                // Assume server sends Opus-encoded audio, decode and play
                 handle_received_opus_from_server((const uint8_t *)data->data_ptr, data->data_len);
             }
             break;
@@ -216,9 +166,11 @@ static void send_start_message(void) {
         ESP_LOGE(TAG, "Cannot send start message: WebSocket not connected");
         return;
     }
-    const char *json_str = "{\"message\": \"start\"}";
+    char json_str[256];
+    snprintf(json_str, sizeof(json_str),
+             "{\"type\":\"start\",\"session_id\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"frame_duration\":%d}",
+             session_id, SAMPLE_RATE, CHANNELS, FRAME_DURATION);
     esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
-    ESP_LOGI(TAG, "Sent: %s", json_str);
 }
 
 static void send_stop_message(void) {
@@ -233,45 +185,60 @@ static void send_stop_message(void) {
     esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
 }
 
-void set_app_state(app_state_t new_state) {
-    if (app_state != new_state) {
-        ESP_LOGI(TAG, "State change: %d -> %d", app_state, new_state);
-        app_state = new_state;
-    }
-}
-
 void __read_task(void *arg) {
+    // Align buffers to 16 bytes for better performance
     uint8_t data[MAX_FRAME_SIZE] __attribute__((aligned(16)));
+    int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));
     while (1) {
-        if (app_state == STATE_RECORDING) {
+        if (is_recording) {
             uint16_t len = vb6824_audio_read(data, sizeof(data));
             if (len > 0) {
+                // Send the Opus data through WebSocket if connected
                 if (ws_connected && ws_client) {
+                    // Create a buffer for the complete frame (4 bytes header + data)
                     uint8_t frame_buffer[MAX_FRAME_SIZE + 4];
+                    // Add frame length header (4 bytes) in big-endian format
                     uint32_t frame_len = htonl(len);
                     memcpy(frame_buffer, &frame_len, 4);
+                    // Copy the Opus data after the header
                     memcpy(frame_buffer + 4, data, len);
+                    // Send the complete frame
                     esp_websocket_client_send_bin(ws_client, (const char *)frame_buffer, len + 4, portMAX_DELAY);
                     ESP_LOGD(TAG, "Sent frame: %d bytes", len + 4);
                 }
+                // Decode for local playback if needed
+                // int frame_size = opus_codec_decode(s_opus_codec, data, len, pcm_data);
+                // if (frame_size > 0) {
+                //     vb6824_audio_write((uint8_t *)pcm_data, frame_size * 2);
+                // } else {
+                //     ESP_LOGE(TAG, "Failed to decode Opus data: %d", frame_size);
+                // }
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(100)); // Avoid busy waiting
         }
     }
 }
 
 static void button_task(void *arg) {
-    bool last_button_state = false;
+    bool last_button_state = false; // Button not pressed (active high)
     while (1) {
         bool current_button_state = gpio_get_level(BUTTON_GPIO);
-        if (!current_button_state && last_button_state) {
-            playback_enabled = !playback_enabled; // Toggle playback
-            ESP_LOGI(TAG, "Playback %s", playback_enabled ? "ENABLED" : "DISABLED");
-            if (playback_enabled) {
+        // Button pressed (active high)
+        if (current_button_state && !last_button_state) {
+            if (!is_recording) {
+                is_recording = true;
+                ESP_LOGI(TAG, "Button pressed: Starting recording session");
                 send_start_message();
             }
-            vTaskDelay(pdMS_TO_TICKS(200)); // Debounce
+        }
+        // Button released (active low)
+        if (!current_button_state && last_button_state) {
+            if (is_recording) {
+                is_recording = false;
+                ESP_LOGI(TAG, "Button released: Stopping recording session");
+                send_stop_message();
+            }
         }
         last_button_state = current_button_state;
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -304,15 +271,6 @@ void app_main(void) {
     };
     gpio_config(&io_conf);
 
-    gpio_config_t vol_io_conf = {
-        .pin_bit_mask = (1ULL << VOLUME_UP_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&vol_io_conf);
-
     s_opus_codec = opus_codec_init(SAMPLE_RATE, SAMPLE_RATE, FRAME_DURATION, CHANNELS);
     if (s_opus_codec == NULL) {
         ESP_LOGE(TAG, "Failed to initialize Opus codec");
@@ -326,7 +284,7 @@ void app_main(void) {
     vb6824_audio_enable_input(1);
     vb6824_audio_enable_output(1);
 
-    // Initialize WebSocket client
+    // Initialize WebSocket client with improved configuration
     esp_websocket_client_config_t ws_cfg = {
         .uri = WS_URI,
         .task_prio = 5,
@@ -352,6 +310,7 @@ void app_main(void) {
         .ping_interval_sec = 10,
         .pingpong_timeout_sec = 20,
     };
+    
     ws_client = esp_websocket_client_init(&ws_cfg);
     if (ws_client == NULL) {
         ESP_LOGE(TAG, "Failed to initialize WebSocket client");
@@ -360,7 +319,7 @@ void app_main(void) {
         esp_websocket_client_start(ws_client);
     }
 
-    // Start button task
+    // Create tasks with increased stack size
+    xTaskCreate(__read_task, "read_task", READ_TASK_STACK_SIZE, NULL, 10, &read_task_handle);
     xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
-    xTaskCreate(volume_up_task, "volume_up_task", 2048, NULL, 5, NULL);
 }
