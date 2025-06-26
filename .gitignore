@@ -5,6 +5,10 @@ build/
 sdkconfig
 sdkconfig.old
 dependencies.lock
+partition_table/
+*.bin
+*.elf
+*.map
 
 # IDE specific
 .vscode/
@@ -28,8 +32,11 @@ dependencies.lock
 # Compiled Static libraries
 *.lai
 *.la
-*.a
 *.lib
+
+# Static libraries (.a files) - but allow essential VB6824 libs
+*.a
+!components/vb6824/libs/*.a
 
 # Executables
 *.exe
@@ -50,3 +57,16 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf 
+
+# Core dumps and logs
+*.core
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS system files
+.DS_Store
+Thumbs.db 
