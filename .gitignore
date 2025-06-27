@@ -1,8 +1,7 @@
 # Build directory
 build/
 
-# ESP-IDF specific
-sdkconfig
+# ESP-IDF specific build artifacts (keep configs)
 sdkconfig.old
 dependencies.lock
 partition_table/
@@ -29,14 +28,10 @@ partition_table/
 *.dylib
 *.dll
 
-# Compiled Static libraries
+# Compiled Static libraries (keep .a files for project libraries)
 *.lai
 *.la
 *.lib
-
-# Static libraries (.a files) - but allow essential VB6824 libs
-*.a
-!components/vb6824/libs/*.a
 
 # Executables
 *.exe
