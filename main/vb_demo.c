@@ -11,9 +11,10 @@
 #include <arpa/inet.h>  // For htonl
 #include "esp_random.h"  // For UUID generation
 #include <inttypes.h>   // For PRIx32 format specifiers
+#include "mqtt_handler.h"
 
 #define TAG "VB_DEMO"
-#define WS_URI "ws://64.227.165.99:5000/ws/audio"
+#define WS_URI "ws://139.59.7.72:5008"
 #define BUTTON_GPIO GPIO_NUM_3  // Using GPIO3 as button input
 
 // WiFi credentials
@@ -26,7 +27,7 @@
 #define FRAME_DURATION 60  // ms (60ms per frame)
 #define FRAME_SIZE (SAMPLE_RATE * FRAME_DURATION / 1000)  // 960 samples for 60ms at 16kHz
 #define MAX_FRAME_SIZE 1275  // Maximum Opus frame size
-#define READ_TASK_STACK_SIZE 8192
+#define READ_TASK_STACK_SIZE (10*1024)
 
 // Session control
 static char session_id[37];  // UUID4 string length + null terminator
@@ -35,6 +36,9 @@ esp_websocket_client_handle_t ws_client = NULL;
 TaskHandle_t read_task_handle = NULL;
 bool is_recording = false;
 bool ws_connected = false;
+
+// MQTT integration
+static bool mqtt_ready = false;
 
 // Generate a UUID4 string (RFC 4122 compliant)
 static void generate_uuid4(char *uuid_str) {
@@ -56,6 +60,25 @@ static void generate_uuid4(char *uuid_str) {
     );
 }
 
+// MQTT command callback
+static void mqtt_command_callback(const char *command, const char *data, int data_len, void *user_data) {
+    ESP_LOGI(TAG, "MQTT Command received: %s", command);
+    if (strcmp(command, "audioplay") == 0) {
+        ESP_LOGI(TAG, "Audio playback URL: %.*s", data_len, data);
+        // TODO: Implement audio playback functionality
+    }
+}
+
+// MQTT connection callback
+static void mqtt_connection_callback(bool connected) {
+    if (connected) {
+        ESP_LOGI(TAG, "MQTT connected successfully");
+    } else {
+        ESP_LOGW(TAG, "MQTT disconnected");
+        mqtt_ready = false;
+    }
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data)
 {
@@ -66,6 +89,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // Start MQTT client after getting IP
+        ESP_LOGI(TAG, "Starting MQTT client...");
+        esp_err_t ret = mqtt_handler_start();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(ret));
+        }
     }
 }
 
@@ -132,26 +162,28 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
+            ESP_LOGI(TAG, "✅ WEBSOCKET_EVENT_CONNECTED to %s", WS_URI);
             ws_connected = true;
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+            ESP_LOGI(TAG, "❌ WEBSOCKET_EVENT_DISCONNECTED");
             ws_connected = false;
             break;
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
+            ESP_LOGE(TAG, "❌ WEBSOCKET_EVENT_ERROR");
             ws_connected = false;
             break;
         case WEBSOCKET_EVENT_DATA:
             if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
-                ESP_LOGI(TAG, "Received server JSON: %.*s", data->data_len, (char *)data->data_ptr);
+                ESP_LOGI(TAG, "📨 Received server JSON: %.*s", data->data_len, (char *)data->data_ptr);
             } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                ESP_LOGI(TAG, "🎵 Received binary audio data: %d bytes", data->data_len);
                 // Assume server sends Opus-encoded audio, decode and play
                 handle_received_opus_from_server((const uint8_t *)data->data_ptr, data->data_len);
             }
             break;
         default:
+            ESP_LOGD(TAG, "Other WebSocket event: %" PRId32, event_id);
             break;
     }
 }
@@ -162,33 +194,53 @@ void voice_command_callback(char *command, uint16_t len, void *arg)
 }
 
 static void send_start_message(void) {
-    if (!ws_connected) {
-        ESP_LOGE(TAG, "Cannot send start message: WebSocket not connected");
+    if (!ws_connected || !ws_client) {
+        ESP_LOGE(TAG, "Cannot send start message: WebSocket not connected (connected=%d, client=%p)", ws_connected, ws_client);
         return;
     }
-    char json_str[256];
+    
+    // Get auth token from MQTT
+    const char* auth_token = mqtt_get_auth_token();
+    if (!auth_token || strlen(auth_token) == 0) {
+        ESP_LOGE(TAG, "Cannot send start message: No auth token available");
+        return;
+    }
+    
+    char json_str[512];  // Increased buffer size for auth token
     snprintf(json_str, sizeof(json_str),
-             "{\"type\":\"start\",\"session_id\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"frame_duration\":%d}",
-             session_id, SAMPLE_RATE, CHANNELS, FRAME_DURATION);
-    esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
+             "{\"type\":\"start\",\"session_id\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"frame_duration\":%.1f,\"auth_token\":\"%s\"}",
+             session_id, SAMPLE_RATE, CHANNELS, (float)FRAME_DURATION, auth_token);
+    
+    int result = esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
+    if (result < 0) {
+        ESP_LOGE(TAG, "Failed to send start message: %d", result);
+    } else {
+        ESP_LOGI(TAG, "📤 Sent start message: %s", json_str);
+    }
 }
 
 static void send_stop_message(void) {
-    if (!ws_connected) {
-        ESP_LOGE(TAG, "Cannot send stop message: WebSocket not connected");
+    if (!ws_connected || !ws_client) {
+        ESP_LOGE(TAG, "Cannot send stop message: WebSocket not connected (connected=%d, client=%p)", ws_connected, ws_client);
         return;
     }
     char json_str[128];
     snprintf(json_str, sizeof(json_str),
              "{\"type\":\"stop\",\"session_id\":\"%s\"}",
              session_id);
-    esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
+    
+    int result = esp_websocket_client_send_text(ws_client, json_str, strlen(json_str), portMAX_DELAY);
+    if (result < 0) {
+        ESP_LOGE(TAG, "Failed to send stop message: %d", result);
+    } else {
+        ESP_LOGI(TAG, "📤 Sent stop message: %s", json_str);
+    }
 }
 
 void __read_task(void *arg) {
     // Align buffers to 16 bytes for better performance
     uint8_t data[MAX_FRAME_SIZE] __attribute__((aligned(16)));
-    int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));
+    // int16_t pcm_data[FRAME_SIZE] __attribute__((aligned(16)));  // Unused for now
     while (1) {
         if (is_recording) {
             uint16_t len = vb6824_audio_read(data, sizeof(data));
@@ -203,8 +255,14 @@ void __read_task(void *arg) {
                     // Copy the Opus data after the header
                     memcpy(frame_buffer + 4, data, len);
                     // Send the complete frame
-                    esp_websocket_client_send_bin(ws_client, (const char *)frame_buffer, len + 4, portMAX_DELAY);
-                    ESP_LOGD(TAG, "Sent frame: %d bytes", len + 4);
+                    int result = esp_websocket_client_send_bin(ws_client, (const char *)frame_buffer, len + 4, portMAX_DELAY);
+                    if (result < 0) {
+                        ESP_LOGE(TAG, "Failed to send audio frame: %d", result);
+                    } else {
+                        ESP_LOGD(TAG, "📤 Sent audio frame: %d bytes", len + 4);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "WebSocket not connected, skipping audio frame");
                 }
                 // Decode for local playback if needed
                 // int frame_size = opus_codec_decode(s_opus_codec, data, len, pcm_data);
@@ -227,9 +285,15 @@ static void button_task(void *arg) {
         // Button pressed (active high)
         if (current_button_state && !last_button_state) {
             if (!is_recording) {
-                is_recording = true;
-                ESP_LOGI(TAG, "Button pressed: Starting recording session");
-                send_start_message();
+                // Check if we have auth token from MQTT
+                const char* auth_token = mqtt_get_auth_token();
+                if (!auth_token || strlen(auth_token) == 0) {
+                    ESP_LOGW(TAG, "Button pressed but no auth token available - waiting for MQTT setup");
+                } else {
+                    is_recording = true;
+                    ESP_LOGI(TAG, "Button pressed: Starting recording session");
+                    send_start_message();
+                }
             }
         }
         // Button released (active low)
@@ -257,6 +321,17 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Initialize MQTT handler
+    ret = mqtt_handler_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT handler: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Register MQTT callbacks
+    mqtt_register_command_callback(mqtt_command_callback);
+    mqtt_register_connection_callback(mqtt_connection_callback);
 
     // Initialize WiFi
     wifi_init();
@@ -288,7 +363,7 @@ void app_main(void) {
     esp_websocket_client_config_t ws_cfg = {
         .uri = WS_URI,
         .task_prio = 5,
-        .task_stack = 8192,
+        .task_stack = READ_TASK_STACK_SIZE,
         .buffer_size = 1024,
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = 10000,
@@ -305,7 +380,7 @@ void app_main(void) {
         .subprotocol = NULL,
         .user_agent = NULL,
         .headers = NULL,
-        .path = "/ws/audio",
+        .path = NULL,  // Remove path - connect to root
         .disable_pingpong_discon = false,
         .ping_interval_sec = 10,
         .pingpong_timeout_sec = 20,
