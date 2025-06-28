@@ -8,10 +8,11 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
-#include <arpa/inet.h>  // For htonl
+#include <arpa/inet.h>   // For htonl
 #include "esp_random.h"  // For UUID generation
-#include <inttypes.h>   // For PRIx32 format specifiers
+#include <inttypes.h>    // For PRIx32 format specifiers
 #include "mqtt_handler.h"
+#include "led.h"         // Add LED include
 
 #define TAG "VB_DEMO"
 #define WS_URI "ws://139.59.7.72:5008"
@@ -27,7 +28,7 @@
 #define FRAME_DURATION 60  // ms (60ms per frame)
 #define FRAME_SIZE (SAMPLE_RATE * FRAME_DURATION / 1000)  // 960 samples for 60ms at 16kHz
 #define MAX_FRAME_SIZE 1275  // Maximum Opus frame size
-#define READ_TASK_STACK_SIZE (10*1024)
+#define READ_TASK_STACK_SIZE (8*1024)
 
 // Session control
 static char session_id[37];  // UUID4 string length + null terminator
@@ -83,18 +84,25 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi checking...");
+        led_set_color(LED_YELLOW);  // Yellow for WiFi checking
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected");
+        led_set_color(LED_RED);  // Red for WiFi disconnected
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        led_set_color(LED_GREEN);  // Green for WiFi connected
         
         // Start MQTT client after getting IP
         ESP_LOGI(TAG, "Starting MQTT client...");
         esp_err_t ret = mqtt_handler_start();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(ret));
+            led_set_color(LED_RED);  // Red for MQTT failure
         }
     }
 }
@@ -164,23 +172,44 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "✅ WEBSOCKET_EVENT_CONNECTED to %s", WS_URI);
             ws_connected = true;
+            led_set_color(LED_CYAN);  // Cyan for WebSocket connected
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            led_set_color(LED_OFF);  // Back to green
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "❌ WEBSOCKET_EVENT_DISCONNECTED");
             ws_connected = false;
+            led_set_color(LED_RED);  // Back to green (WiFi connected, WS disconnected)
             break;
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "❌ WEBSOCKET_EVENT_ERROR");
             ws_connected = false;
+            led_set_color(LED_RED);  // Red for WebSocket error
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
+                if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
                 ESP_LOGI(TAG, "📨 Received server JSON: %.*s", data->data_len, (char *)data->data_ptr);
-            } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
-                ESP_LOGI(TAG, "🎵 Received binary audio data: %d bytes", data->data_len);
-                // Assume server sends Opus-encoded audio, decode and play
-                handle_received_opus_from_server((const uint8_t *)data->data_ptr, data->data_len);
-            }
+                
+                // Parse JSON to check for stop_stream command
+                char json_str[256];
+                if (data->data_len < sizeof(json_str) - 1) {
+                    memcpy(json_str, data->data_ptr, data->data_len);
+                    json_str[data->data_len] = '\0';
+                    
+                    ESP_LOGI(TAG, "Parsing JSON: %s", json_str);
+                    
+                    // Check if it's a stop_stream message - try multiple patterns
+                    if (strstr(json_str, "stop_stream") != NULL ) {
+                        // ESP_LOGI(TAG, "Found stop_stream command - turning LED OFF");
+                        led_set_color(LED_OFF);  // Turn off LED for stop_stream}
+                        }
+                    }
+                } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                    // ESP_LOGI(TAG, "🎵 Received binary audio data: %d bytes", data->data_len);
+                    led_set_color(LED_BLUE);  // Blue for playing audio
+                    // Assume server sends Opus-encoded audio, decode and play
+                    handle_received_opus_from_server((const uint8_t *)data->data_ptr, data->data_len);
+                }
             break;
         default:
             ESP_LOGD(TAG, "Other WebSocket event: %" PRId32, event_id);
@@ -289,9 +318,13 @@ static void button_task(void *arg) {
                 const char* auth_token = mqtt_get_auth_token();
                 if (!auth_token || strlen(auth_token) == 0) {
                     ESP_LOGW(TAG, "Button pressed but no auth token available - waiting for MQTT setup");
+                    led_set_color(LED_YELLOW);  // Yellow for waiting for auth
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    led_set_color(LED_GREEN);  // Back to green
                 } else {
                     is_recording = true;
                     ESP_LOGI(TAG, "Button pressed: Starting recording session");
+                    led_set_color(LED_MAGENTA);  // Magenta for recording
                     send_start_message();
                 }
             }
@@ -302,6 +335,8 @@ static void button_task(void *arg) {
                 is_recording = false;
                 ESP_LOGI(TAG, "Button released: Stopping recording session");
                 send_stop_message();
+                // Return to previous state after recording
+                led_set_color(LED_OFF);
             }
         }
         last_button_state = current_button_state;
@@ -314,8 +349,16 @@ void app_main(void) {
     generate_uuid4(session_id);
     ESP_LOGI(TAG, "Generated session ID: %s", session_id);
 
+    // Initialize LED
+    esp_err_t ret = led_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize LED: %s", esp_err_to_name(ret));
+    } else {
+        led_set_color(LED_OFF);  // Start with LED off
+    }
+
     // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
+    ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
@@ -326,6 +369,7 @@ void app_main(void) {
     ret = mqtt_handler_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize MQTT handler: %s", esp_err_to_name(ret));
+        led_set_color(LED_RED);  // Red for MQTT init failure
         return;
     }
     

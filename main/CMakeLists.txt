@@ -2,6 +2,7 @@ idf_component_register( SRCS
                             "vb_demo.c" 
                             "opus_wapper.c"
                             "mqtt_handler.c"
+                            "led.c"
                     
                         INCLUDE_DIRS "."
                             REQUIRES 
